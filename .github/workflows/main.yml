@@ -1,0 +1,235 @@
+name: HOPE - Auto Detect & Build APK
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Scan repository and detect Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$GITHUB_WORKSPACE"
+
+          echo "========================================"
+          echo "Scanning entire repository..."
+          echo "Root: $ROOT"
+          echo "========================================"
+
+          mapfile -t PUBSPECS < <(
+            find "$ROOT" \
+              -type f \
+              -name "pubspec.yaml" \
+              -not -path "*/.git/*" \
+              -not -path "*/build/*" \
+              -not -path "*/.dart_tool/*" \
+              | sort
+          )
+
+          if [ "${#PUBSPECS[@]}" -eq 0 ]; then
+            echo "::error::No pubspec.yaml was found anywhere in the repository."
+            echo ""
+            echo "Repository tree:"
+            find "$ROOT" -maxdepth 4 -type f | sort | head -500
+            exit 1
+          fi
+
+          echo "Found ${#PUBSPECS[@]} pubspec.yaml file(s):"
+          printf ' - %s\n' "${PUBSPECS[@]}"
+
+          BEST=""
+          BEST_SCORE=-1
+
+          for PUBSPEC in "${PUBSPECS[@]}"; do
+            DIR="$(dirname "$PUBSPEC")"
+            SCORE=0
+
+            echo ""
+            echo "Checking candidate:"
+            echo "$DIR"
+
+            # pubspec itself
+            SCORE=$((SCORE + 1))
+
+            # Flutter project indicators
+            if [ -d "$DIR/lib" ]; then
+              SCORE=$((SCORE + 10))
+            fi
+
+            if [ -d "$DIR/android" ]; then
+              SCORE=$((SCORE + 10))
+            fi
+
+            if [ -d "$DIR/ios" ]; then
+              SCORE=$((SCORE + 5))
+            fi
+
+            if [ -d "$DIR/test" ]; then
+              SCORE=$((SCORE + 3))
+            fi
+
+            if grep -Eq '^[[:space:]]*flutter:[[:space:]]*$' "$PUBSPEC" \
+              || grep -Eq '^[[:space:]]*flutter:' "$PUBSPEC"; then
+              SCORE=$((SCORE + 20))
+            fi
+
+            if grep -Eq 'sdk:[[:space:]]*flutter' "$PUBSPEC"; then
+              SCORE=$((SCORE + 20))
+            fi
+
+            echo "Score: $SCORE"
+
+            if [ "$SCORE" -gt "$BEST_SCORE" ]; then
+              BEST="$DIR"
+              BEST_SCORE="$SCORE"
+            fi
+          done
+
+          if [ -z "$BEST" ]; then
+            echo "::error::Could not select a Flutter project."
+            exit 1
+          fi
+
+          echo ""
+          echo "========================================"
+          echo "SELECTED FLUTTER PROJECT"
+          echo "========================================"
+          echo "$BEST"
+          echo "Score: $BEST_SCORE"
+          echo "========================================"
+
+          # Final validation
+          test -f "$BEST/pubspec.yaml"
+          test -d "$BEST/lib"
+
+          if [ ! -d "$BEST/android" ]; then
+            echo "::warning::Selected Flutter project has no android directory."
+          fi
+
+          echo "PROJECT_DIR=$BEST" >> "$GITHUB_ENV"
+
+      - name: Show selected project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Selected project:"
+          echo "$PROJECT_DIR"
+          echo ""
+
+          echo "Project files:"
+          find "$PROJECT_DIR" -maxdepth 2 -type f | sort | head -300
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.47.1"
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Get Flutter dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: Analyze Flutter project
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter analyze
+
+      - name: Run Flutter tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter test --coverage
+
+      - name: Verify Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -d "$PROJECT_DIR/android" ]; then
+            echo "::error::No Android project was found in the selected Flutter project."
+            exit 1
+          fi
+
+          echo "Android project found:"
+          echo "$PROJECT_DIR/android"
+
+      - name: Build Debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+
+          flutter build apk --debug
+
+      - name: Find generated APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Searching entire selected project for APK files..."
+
+          mapfile -t APKS < <(
+            find "$PROJECT_DIR" \
+              -type f \
+              -name "*.apk" \
+              -not -path "*/.git/*" \
+              | sort
+          )
+
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "::error::Build completed but no APK was found."
+            exit 1
+          fi
+
+          echo "Found APK file(s):"
+          printf ' - %s\n' "${APKS[@]}"
+
+          APK="${APKS[0]}"
+
+          echo "Selected APK:"
+          echo "$APK"
+
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-debug-apk
+          path: ${{ env.APK_PATH }}
+          if-no-files-found: error
+
+      - name: Build summary
+        shell: bash
+        run: |
+          {
+            echo "## HOPE APK Build"
+            echo ""
+            echo "### Flutter project detected"
+            echo "\`$PROJECT_DIR\`"
+            echo ""
+            echo "### APK"
+            echo "\`$APK_PATH\`"
+            echo ""
+            echo "### Status"
+            echo "Build completed successfully."
+          } >> "$GITHUB_STEP_SUMMARY"
